@@ -241,8 +241,16 @@ async def task_websocket(websocket: WebSocket, task_id: str):
         await websocket.send_json({"type": "error", "message": error_msg})
     finally:
         task_info["status"] = "done"
-        await ctx.close()
-        await browser.close()
+        try:
+            if 'ctx' in dir():
+                await ctx.close()
+        except Exception:
+            pass
+        try:
+            if 'browser' in dir():
+                await browser.close()
+        except Exception:
+            pass
         _browsers.pop(task_id, None)
         await websocket.close()
 

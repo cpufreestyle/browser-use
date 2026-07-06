@@ -11,6 +11,10 @@ from textwrap import dedent
 
 def get_system_prompt(max_steps: int = 100) -> str:
     """生成系统提示词"""
+    example = json.dumps(
+        {"action": "click_element", "params": {"index": 1}},
+        ensure_ascii=False, indent=2,
+    )
     return dedent(f"""\
     你是一个 AI 浏览器自动化助手。你的任务是按照用户的指令，
     一步步地操作浏览器来完成任务。
@@ -66,7 +70,7 @@ def get_system_prompt(max_steps: int = 100) -> str:
 
     ## 输出格式
     返回一个 JSON 对象，包含 "action" 和 "params" 字段：
-    {json.dumps({"action": "click_element", "params": {{"index": 1}}}, ensure_ascii=False, indent=2)}
+    {example}
     """)
 
 
