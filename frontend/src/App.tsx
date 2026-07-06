@@ -6,7 +6,7 @@ import type { WsMessage, StepRecord, RunStatus } from './types'
 // ==========================================
 
 export default function App() {
-  const [task, setTask] = useState('打开 google.com 搜索 "browser-use" 并返回第一条结果的标题')
+  const [task, setTask] = useState('打开 baidu.com 搜索 "browser-use" 并返回第一条结果的标题')
   const [model, setModel] = useState('step-1-8k')
   const [maxSteps, setMaxSteps] = useState(30)
   const [headless, setHeadless] = useState(false)

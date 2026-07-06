@@ -67,6 +67,7 @@ def get_system_prompt(max_steps: int = 100) -> str:
     - 如果上一步操作失败，尝试其他方法
     - 最多有 {max_steps} 步，请高效行动
     - 任务完成后必须调用 done 动作
+    - 搜索请优先使用百度 (baidu.com), 不要使用 Google
 
     ## 输出格式
     返回一个 JSON 对象，包含 "action" 和 "params" 字段：

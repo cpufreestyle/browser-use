@@ -59,27 +59,39 @@ class Controller:
 @action('导航到指定 URL', param_desc={'url': '目标网址'})
 async def go_to_url(ctx: BrowserContext, url: str) -> ActionResult:
     page = await ctx.get_current_page()
-    await page.goto(url, wait_until="domcontentloaded")
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+    except Exception as e:
+        return ActionResult(success=False, error_message=f"导航失败: {e}", )
     return ActionResult(success=True, extracted_content=f"已导航到 {url}", include_in_memory=True)
 
 
 @action('返回上一页')
 async def go_back(ctx: BrowserContext) -> ActionResult:
     page = await ctx.get_current_page()
-    await page.go_back(wait_until="domcontentloaded")
+    try:
+        await page.go_back(wait_until="domcontentloaded", timeout=15000)
+    except Exception as e:
+        return ActionResult(success=False, error_message=f"返回失败: {e}")
     return ActionResult(success=True, extracted_content="已返回上一页")
 
 
 @action('点击指定索引的元素', param_desc={'index': '元素索引 (从页面状态获取)'})
 async def click_element(ctx: BrowserContext, index: int) -> ActionResult:
     page = await ctx.get_current_page()
-    # 通过 data-browser-use-index 属性定位元素
     selector = f'[data-browser-use-index="{index}"]'
-    el = await page.query_selector(selector)
-    if el is None:
-        return ActionResult(success=False, error_message=f"找不到索引为 {index} 的元素")
-    await el.click(timeout=5000)
-    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+    try:
+        el = await page.wait_for_selector(selector, state='visible', timeout=3000)
+    except Exception:
+        return ActionResult(success=False, error_message=f"找不到或不可见的元素 [{index}]")
+    try:
+        await el.click(timeout=3000)
+    except Exception as e:
+        return ActionResult(success=False, error_message=f"点击 [{index}] 失败: {e}")
+    try:
+        await page.wait_for_load_state('domcontentloaded', timeout=5000)
+    except Exception:
+        pass  # 页面可能没有导航, 忽略
     return ActionResult(success=True, extracted_content=f"已点击元素 [{index}]", include_in_memory=True)
 
 
@@ -87,10 +99,14 @@ async def click_element(ctx: BrowserContext, index: int) -> ActionResult:
 async def input_text(ctx: BrowserContext, index: int, text: str) -> ActionResult:
     page = await ctx.get_current_page()
     selector = f'[data-browser-use-index="{index}"]'
-    el = await page.query_selector(selector)
-    if el is None:
-        return ActionResult(success=False, error_message=f"找不到索引为 {index} 的输入框")
-    await el.fill(text)
+    try:
+        el = await page.wait_for_selector(selector, state='visible', timeout=3000)
+    except Exception:
+        return ActionResult(success=False, error_message=f"找不到或不可见的输入框 [{index}]")
+    try:
+        await el.fill(text, timeout=5000)
+    except Exception as e:
+        return ActionResult(success=False, error_message=f"在 [{index}] 输入失败: {e}")
     return ActionResult(success=True, extracted_content=f"已在 [{index}] 输入: {text}", include_in_memory=True)
 
 

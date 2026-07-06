@@ -28,10 +28,21 @@ _EXTRACT_JS = """
     const results = [];
     let index = 1;
 
+    function isVisible(el) {
+        // 过滤隐藏元素: offsetParent 为 null 且不是 input[type=hidden]
+        if (el.offsetParent === null && el.tagName !== 'INPUT') return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+        if (style.opacity === '0') return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return false;
+        return true;
+    }
+
     for (const selector of interactiveSelectors) {
         for (const el of document.querySelectorAll(selector)) {
             if (seen.has(el)) continue;
-            if (el.offsetParent === null && el.tagName !== 'INPUT') continue;
+            if (!isVisible(el)) continue;
             seen.add(el);
 
             // 打上索引标记
