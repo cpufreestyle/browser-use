@@ -15,9 +15,10 @@ from __future__ import annotations
 import json
 import time
 import logging
+import asyncio
 from typing import Any, Optional
 
-from openai import OpenAI
+from openai import OpenAI, APIError, APIConnectionError, RateLimitError, APITimeoutError
 
 from browser_use.agent.memory import Memory
 from browser_use.agent.prompts import get_system_prompt, get_user_prompt
@@ -33,6 +34,14 @@ logger = logging.getLogger("browser_use.agent")
 class Agent:
     """AI 浏览器自动化 Agent"""
 
+    # 重试配置
+    LLM_MAX_RETRIES = 3
+    LLM_BASE_DELAY = 1.0       # 首次重试等待 1s
+    LLM_MAX_DELAY = 16.0       # 最大退避 16s
+    STEP_MAX_RETRIES = 2       # 单步失败后最多重试 2 次
+    GLOBAL_TIMEOUT = 300       # 全局超时 5 分钟
+    CONSECUTIVE_ERROR_LIMIT = 5  # 连续失败 5 次则停止
+
     def __init__(
         self,
         task: str,
@@ -42,6 +51,9 @@ class Agent:
         model: str = "gpt-4o",
         max_steps: int = 50,
         debug: bool = True,
+        llm_max_retries: int = None,
+        step_max_retries: int = None,
+        global_timeout: int = None,
     ):
         self.task = task
         self.llm_client = llm_client
@@ -49,46 +61,100 @@ class Agent:
         self.max_steps = max_steps
         self.debug = debug
 
+        # 重试参数（可覆盖默认值）
+        self.llm_max_retries = llm_max_retries or self.LLM_MAX_RETRIES
+        self.step_max_retries = step_max_retries or self.STEP_MAX_RETRIES
+        self.global_timeout = global_timeout or self.GLOBAL_TIMEOUT
+
         self.browser_context = browser_context or BrowserContext()
         self.controller = controller or Controller()
         self.memory = Memory(get_system_prompt(max_steps), max_steps * 4)
         self.memory.add_user_message(get_user_prompt(task))
         self.status = AgentStatus.IDLE
         self.history = AgentHistoryList()
+        self._consecutive_errors = 0  # 连续错误计数
 
     async def run(self, max_steps: Optional[int] = None) -> AgentHistoryList:
-        """运行 Agent 直到任务完成或达到最大步数"""
+        """运行 Agent 直到任务完成或达到最大步数
+
+        改进: 全局超时 + 错误恢复 + 连续失败保护
+        """
         max_steps = max_steps or self.max_steps
         step_info = AgentStepInfo(step_number=1, max_steps=max_steps)
         self.status = AgentStatus.RUNNING
         self._log("=" * 55, level=logging.INFO)
         self._log(f"Agent 启动 | 任务: {self.task}", level=logging.INFO)
-        self._log(f"模型: {self.model} | 最大步数: {max_steps}", level=logging.INFO)
+        self._log(f"模型: {self.model} | 最大步数: {max_steps} | 超时: {self.global_timeout}s", level=logging.INFO)
         self._log("=" * 55, level=logging.INFO)
 
+        start_time = time.time()
+
+        try:
+            await asyncio.wait_for(
+                self._run_loop(step_info, max_steps, start_time),
+                timeout=self.global_timeout,
+            )
+        except asyncio.TimeoutError:
+            self._log(f"全局超时 ({self.global_timeout}s), 强制停止", level=logging.ERROR)
+            self.status = AgentStatus.ERROR
+        except Exception as e:
+            self._log(f"Agent 运行异常: {e}", level=logging.ERROR)
+            logger.exception("Agent run failed")
+            self.status = AgentStatus.ERROR
+
+        self._log_summary()
+        return self.history
+
+    async def _run_loop(self, step_info: AgentStepInfo, max_steps: int, start_time: float):
+        """主循环 — 从 run() 中抽出以便添加全局超时"""
         while step_info.step_number <= max_steps:
             if self.status != AgentStatus.RUNNING:
                 self._log("Agent 已停止", level=logging.WARNING)
                 break
-            try:
-                done = await self._step(step_info)
-                if done:
-                    self.status = AgentStatus.DONE
-                    self._log("任务完成!", level=logging.INFO)
-                    break
-                if step_info.is_last_step:
-                    self._log("达到最大步数, 强制结束", level=logging.WARNING)
-                    self.status = AgentStatus.STOPPED
-                    break
-            except Exception as e:
-                self.status = AgentStatus.ERROR
-                self._log(f"步骤 {step_info.step_number} 出错: {e}", level=logging.ERROR)
-                logger.exception("Agent step failed")
-                break
-            step_info.increment()
 
-        self._log_summary()
-        return self.history
+            # 检查连续错误
+            if self._consecutive_errors >= self.CONSECUTIVE_ERROR_LIMIT:
+                self._log(f"连续 {self._consecutive_errors} 次错误, 停止 Agent", level=logging.ERROR)
+                self.status = AgentStatus.ERROR
+                break
+
+            elapsed = time.time() - start_time
+            self._log(f"  已运行 {elapsed:.0f}s / {self.global_timeout}s", level=logging.DEBUG)
+
+            # 尝试当前步骤, 失败则重试
+            step_succeeded = False
+            for attempt in range(1, self.step_max_retries + 1):
+                try:
+                    done = await self._step(step_info)
+                    step_succeeded = True
+                    self._consecutive_errors = 0  # 重置连续错误计数
+
+                    if done:
+                        self.status = AgentStatus.DONE
+                        self._log("任务完成!", level=logging.INFO)
+                        return
+
+                    if step_info.is_last_step:
+                        self._log("达到最大步数, 强制结束", level=logging.WARNING)
+                        self.status = AgentStatus.STOPPED
+                        return
+                    break  # 步骤成功, 跳出重试循环
+                except Exception as e:
+                    self._log(
+                        f"步骤 {step_info.step_number} 第 {attempt}/{self.step_max_retries} 次失败: {e}",
+                        level=logging.WARNING,
+                    )
+                    if attempt < self.step_max_retries:
+                        delay = 2 ** (attempt - 1)  # 1s, 2s, 4s...
+                        self._log(f"  等待 {delay}s 后重试...", level=logging.INFO)
+                        await asyncio.sleep(delay)
+                    else:
+                        self._consecutive_errors += 1
+                        self._log(f"步骤 {step_info.step_number} 重试耗尽, 跳过", level=logging.ERROR)
+                        logger.exception(f"Agent step {step_info.step_number} failed after {attempt} retries")
+                        # 不 break, 继续下一步 (优雅降级)
+
+            step_info.increment()
 
     async def _step(self, step_info: AgentStepInfo) -> bool:
         """执行一轮决策循环, 返回 True 表示任务完成"""
@@ -165,13 +231,39 @@ class Agent:
         )
 
     def _call_llm(self) -> str:
-        """调用 LLM 并返回文本回复"""
-        resp = self.llm_client.chat.completions.create(
-            model=self.model,
-            messages=self.memory.get_messages(),
-            temperature=0.1,
-        )
-        return resp.choices[0].message.content or ""
+        """调用 LLM 并返回文本回复
+
+        改进: 指数退避重试, 处理网络/限流/超时等瞬时错误
+        """
+        last_error = None
+        for attempt in range(1, self.llm_max_retries + 1):
+            try:
+                resp = self.llm_client.chat.completions.create(
+                    model=self.model,
+                    messages=self.memory.get_messages(),
+                    temperature=0.1,
+                )
+                return resp.choices[0].message.content or ""
+            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                last_error = e
+                if attempt < self.llm_max_retries:
+                    delay = min(self.LLM_BASE_DELAY * (2 ** (attempt - 1)), self.LLM_MAX_DELAY)
+                    self._log(f"  LLM 调用失败 ({type(e).__name__}), {delay:.1f}s 后重试 ({attempt}/{self.llm_max_retries})", level=logging.WARNING)
+                    time.sleep(delay)
+                else:
+                    self._log(f"  LLM 调用失败, 重试 {self.llm_max_retries} 次后仍报错: {e}", level=logging.ERROR)
+                    raise
+            except APIError as e:
+                last_error = e
+                if getattr(e, 'status_code', 500) >= 500 and attempt < self.llm_max_retries:
+                    delay = min(self.LLM_BASE_DELAY * (2 ** (attempt - 1)), self.LLM_MAX_DELAY)
+                    self._log(f"  LLM 服务端错误 ({e.status_code}), {delay:.1f}s 后重试 ({attempt}/{self.llm_max_retries})", level=logging.WARNING)
+                    time.sleep(delay)
+                else:
+                    self._log(f"  LLM API 错误: {e}", level=logging.ERROR)
+                    raise
+        # 不应该走到这里
+        raise last_error or RuntimeError("LLM 调用失败, 未知原因")
 
     def _parse_action(self, text: str) -> Optional[dict]:
         """从 LLM 回复中解析动作 JSON"""
